@@ -6,5 +6,11 @@ steps:
       - '-c'
       - 'chmod +x ./host.sh'
 
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - './host.sh'
+
 # Optionnel : spécifiez les substitutions, images, etc.
 timeout: '120s'
