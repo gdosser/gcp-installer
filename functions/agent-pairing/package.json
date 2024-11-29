@@ -1,0 +1,11 @@
+{
+  "name": "pairing",
+  "version": "1.0.1",
+  "description": "pairing an host to a backend",
+  "main": "index.js",
+  "author": "gdosser",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

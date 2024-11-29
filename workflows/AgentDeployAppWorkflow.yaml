@@ -1,0 +1,421 @@
+# architectureFile,
+# artifacts,
+#############################################################################
+#                             DEPLOY WORKFLOW
+#############################################################################
+main:
+    params: [args]
+    steps:
+
+      # Download artifacts (only artifacts that are not already downloaded are downloaded)
+      # As url are short lived url, we need to do that ASAP
+      - download_artifacts:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/downloadArtifacts"}
+              auth:
+                type: OIDC
+              body: 
+                artifactsFile: ${args.artifactsFile}
+          retry: ${http.default_retry}
+
+      # Get the plan
+      - get_plan:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/getPlan"}
+              auth:
+                type: OIDC
+              body:
+                planFile: ${args.planFile}
+            result: plan_response
+          retry: ${http.default_retry}
+
+      # Assign the plan
+      - assign_plan:
+          assign:
+            - plan: ${plan_response.body}      
+
+      - syslog_plan:
+          call: sys.log
+          args:
+            data: ${json.encode_to_string(plan_response.body)}
+
+      # Execute in order the plan group of steps by group of steps that are done in //
+      - execute_plan:
+          for:
+            value: steps
+            in: ${plan}
+            steps:
+
+              - get_outputs:
+                  try:
+                    call: http.post
+                    args:
+                      url: ${"{{HOST_URL}}/workflow/getOutputs"}
+                      auth:
+                        type: OIDC
+                      body:
+                        appId: ${args.appId}
+                    result: outputs_response
+                  retry: ${http.default_retry}
+
+              - assign_outputs:
+                  assign:
+                    - outputs: ${outputs_response.body}
+
+              - execute_steps:
+                  parallel:
+                    for:
+                      value: step
+                      in: ${steps}
+                      steps:
+
+                        - set_deployment_step_state_started:
+                            try:
+                              call: http.post
+                              args:
+                                url: ${"{{HOST_URL}}/workflow/setStepStarted"}
+                                auth:
+                                  type: OIDC
+                                body:
+                                  appId: ${args.appId}
+                                  deploymentId: ${args.deploymentId}
+                                  stepId: ${step.stepId}
+                            retry: ${http.default_retry}
+
+                        - execute_step:
+                            switch:
+
+                                - condition: ${step.action == "services:create" OR step.action == "services:update"}
+                                  steps:
+                                    - service_deploy:
+                                        call: service_deploy_workflow
+                                        args:
+                                          appId: ${args.appId}
+                                          appShortId: ${args.appShortId}
+                                          deploymentId: ${args.deploymentId}
+                                          serviceId: ${step.data.serviceId}
+                                          service: ${step.data.service}
+
+                                - condition: ${step.action == "layers:create" OR step.action == "layers:update"}
+                                  steps:
+                                    - layer_deploy:
+                                        call: service_layer_deploy_workflow
+                                        args:
+                                          appId: ${args.appId}
+                                          appShortId: ${args.appShortId}
+                                          deploymentId: ${args.deploymentId}
+                                          layerId: ${step.data.layerId}
+                                          layer: ${step.data.layer}
+
+                                - condition: ${step.action == "accounts:create"}
+                                  steps:
+                                    - account_create:
+                                        call: account_create_workflow
+                                        args:
+                                          appId: ${args.appId}
+                                          appShortId: ${args.appShortId}
+                                          deploymentId: ${args.deploymentId}
+                                          resourceId: ${step.data.resourceId}
+                                          account: ${step.data.account}
+
+                                - condition: ${step.action == "resources:create"}
+                                  steps:
+                                    - resource_create:
+                                        call: resource_create_workflow
+                                        args:
+                                          deploymentId: ${args.deploymentId}
+                                          resourceId: ${step.data.resourceId}
+                                          resource: ${step.data.resource}
+                                          outputs: ${outputs}
+
+                        - set_deployment_step_state_finished:
+                            try:
+                              call: http.post
+                              args:
+                                url: ${"{{HOST_URL}}/workflow/setStepFinished"}
+                                auth:
+                                  type: OIDC
+                                body:
+                                  appId: ${args.appId}
+                                  deploymentId: ${args.deploymentId}
+                                  stepId: ${step.stepId}
+                            retry: ${http.default_retry}
+
+
+#############################################################################################
+# DEPLOY A SERVICE
+#############################################################################################
+service_deploy_workflow:
+  params: [deploymentId, appId, appShortId, serviceId, service]
+  steps:
+
+      - download_cloud_build_yaml:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/getServiceDeployYaml"}
+              auth:
+                type: OIDC
+              body: 
+                service: ${service}
+            result: cloudbuid_response
+          retry: ${http.default_retry}      
+
+      - execute_cloud_build_yaml:
+          call: googleapis.cloudbuild.v1.projects.builds.create
+          args:
+            projectId: {{PROJECT_ID}}
+            parent: ${"projects/{{PROJECT_ID}}/locations/global"}
+            body:
+              source:
+                storageSource:
+                  bucket: {{SERVICES_ARCHIVE_BUCKET}}
+                  object: ${service + ".zip"}
+              steps: ${cloudbuid_response.body.steps}
+              timeout: ${cloudbuid_response.body.timeout}
+              substitutions:
+                _PROJECT_ID: {{PROJECT_ID}}
+                _HOST_ID: {{HOST_ID}}
+                _HOST_SHORT_ID: {{HOST_SHORT_ID}}
+                _APP_ID: ${appId}
+                _APP_SHORT_ID: ${appShortId}
+                _DEPLOYMENT_ID: ${deploymentId}
+                _LOCATION: {{LOCATION}}
+                _RESOURCES_ARCHIVE_BUCKET: {{RESOURCES_ARCHIVE_BUCKET}}
+              options:
+                logging: CLOUD_LOGGING_ONLY
+          result: build
+
+      - get_service_url_from_outputs:
+          assign:
+            - output: ${json.decode(base64.decode(build.metadata.build.results.buildStepOutputs[len(build.metadata.build.results.buildStepOutputs) - 1]))}
+
+      - update_service_state:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/updateState"}
+              auth:
+                type: OIDC
+              body:
+                appId: ${appId}
+                type: services
+                key: ${serviceId}
+                data: 
+                  serviceId: ${serviceId}
+                  service: ${service}
+                output: ${output}
+          retry: ${http.default_retry}  
+
+
+#############################################################################################
+# DEPLOY A SERVICE LAYER
+#############################################################################################
+service_layer_deploy_workflow:
+  params: [appId, appShortId, deploymentId, layerId, layer]
+  steps:
+
+      - service_layer_deploy:
+          switch:
+
+              - condition: ${text.match_regex(layerId, "_service_layer_nodejs$")}
+                steps:
+                  - service_layer_deploy_nodejs:
+                      call: service_layer_deploy_nodejs_workflow
+                      args:
+                        appId: ${appId}
+                        appShortId: ${appShortId}
+                        deploymentId: ${deploymentId}
+                        layerId: ${layerId}
+                        layer: ${layer}
+
+
+# TODO raise error if no condition is matched
+
+#############################################################################################
+# DEPLOY A SERVICE LAYER - NODEJS
+#############################################################################################
+service_layer_deploy_nodejs_workflow:
+  params: [appId, appShortId, deploymentId, layerId, layer]
+  steps:
+
+      - create_service_layer_nodejs:
+          call: googleapis.cloudbuild.v1.projects.builds.create
+          args:
+            projectId: {{PROJECT_ID}}
+            parent: ${"projects/{{PROJECT_ID}}/locations/global"}
+            body:
+              source:
+                storageSource:
+                  bucket: {{SERVICES_ARCHIVE_BUCKET}}
+                  object: ${layer + ".zip"}
+              steps:
+
+                - id: 'deploy layer'
+                  name: 'gcr.io/cloud-builders/npm'
+                  entrypoint: 'bash'
+                  args:
+                  - '-c'
+                  - |
+                      set -e
+
+                      echo "@service:registry=https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/" >> ~/.npmrc
+                      echo "//{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages/:always-auth=true" >> ~/.npmrc
+                      npm i google-artifactregistry-auth --no-save
+                      npm_config_registry=https://registry.npmjs.org npx google-artifactregistry-auth
+
+                      LAYER_ID=${_LAYER_ID};
+                      SERVICE=$${LAYER_ID%%/*}
+                      PACKAGE_NAME="$${SERVICE}-framework"
+
+                      # Attempt to retrieve the version of the PACKAGE_NAME
+                      VERSION=$(npm view "$$PACKAGE_NAME" version --registry=https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/ 2>/dev/null)
+
+                      # Check if the command succeeded
+                      if [[ -z "$$VERSION" ]]; then
+                        VERSION="1.0.0"
+                      else
+                        # Split the version into major, minor, and patch
+                        major=$(echo "$$VERSION" | cut -d '.' -f 1)
+                        minor=$(echo "$$VERSION" | cut -d '.' -f 2)
+                        patch=$(echo "$$VERSION" | cut -d '.' -f 3)
+
+                        # Increment the patch version
+                        major=$$((major + 1))
+
+                        # Rebuild the version string
+                        VERSION="$$major.$$minor.$$patch"
+                      fi
+
+                      npm pkg set name=$$PACKAGE_NAME version=$$VERSION
+                      npm publish --registry=https://{{LOCATION}}-npm.pkg.dev/{{PROJECT_ID}}/nodejs-packages-{{HOST_SHORT_ID}}/
+
+              substitutions:
+                _LAYER_ID: ${layerId}
+              options:
+                logging: CLOUD_LOGGING_ONLY
+          result: build
+
+      - update_service_layer_state:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/updateState"}
+              auth:
+                type: OIDC
+              body:
+                appId: ${appId}
+                type: layers
+                key: ${layerId}
+                data: 
+                  layerId: ${layerId}
+                  layer: ${layer}
+                output: {}
+          retry: ${http.default_retry}  
+
+
+#############################################################################################
+# CREATE A SERVICE ACCOUNT **************
+#############################################################################################
+account_create_workflow:
+  params: [appId, appShortId, deploymentId, resourceId, account]
+  steps:
+
+      - create_account:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/createAccount"}
+              auth:
+                type: OIDC
+              body:
+                appId: ${appId}
+                appShortId: ${appShortId}
+                deploymentId: ${deploymentId}
+                resourceId: ${resourceId}
+            result: account_response
+          retry: ${http.default_retry}
+
+      - update_account_state:
+          try:
+            call: http.post
+            args:
+              url: ${"{{HOST_URL}}/workflow/updateState"}
+              auth:
+                type: OIDC
+              body:
+                appId: ${appId}
+                type: accounts
+                key: ${resourceId}
+                data: 
+                  resourceId: ${resourceId}
+                  account: ${account}
+                output:
+                  email: ${account_response.body}
+          retry: ${http.default_retry}          
+
+#############################################################################################
+#
+#############################################################################################
+resource_create_workflow:
+  params: [deploymentId, resourceId, resource, outputs]
+  steps:
+
+      - call_create_resource:
+          try:
+            call: http.post
+            args:
+              url: ${outputs.services[resource.service].url + "/resources"}
+              auth:
+                type: OIDC
+              body:
+                deploymentId: ${deploymentId}
+                resourceId: ${resourceId}
+                resource: ${resource}
+                outputs: ${outputs}
+            result: execution 
+            #result soit c est une execution et on attend du coup, soit c est le resultat direct ok ?
+          retry: ${http.default_retry}
+
+      - check_finished_sync:
+          switch:
+            - condition: ${execution.body.state == "SUCCEEDED"}
+              next: returnResult
+            - condition: ${execution.body.state != "ACTIVE"}
+              raise: Failed to create a resource.
+
+      - initial_wait:
+          call: sys.sleep
+          args:
+            seconds: 5
+          next: check_status
+
+      - check_status:
+          try:
+            call: http.get
+            args:
+              url: ${outputs.services[resource.service].url + "/executions/" + execution.body.name}
+              auth:
+                type: OIDC
+            result: execution
+          retry: ${http.default_retry}
+
+      - check_finished:
+          switch:
+            - condition: ${execution.body.state == "SUCCEEDED"}
+              next: returnResult
+            - condition: ${execution.body.state != "ACTIVE"}
+              raise: Failed to create a resource.
+
+      - wait:
+          call: sys.sleep
+          args:
+            seconds: 10
+          next: check_status
+
+      - returnResult:
+          return: ${json.decode(execution.body.result)}
