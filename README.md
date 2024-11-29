@@ -2,4 +2,4 @@
 
 On cloud shell, run:
 
-curl -o cloudbuild.yaml "https://raw.githubusercontent.com/gdosser/gcp-installer/main/cloudbuild.yaml" && gcloud builds submit --config=cloudbuild.yaml .
+git clone https://github.com/gdosser/gcp-installer.git && gcloud builds submit gcp-installer --config=gcp-installer/cloudbuild.yaml

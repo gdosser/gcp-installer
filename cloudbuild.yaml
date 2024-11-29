@@ -4,7 +4,7 @@ steps:
     entrypoint: 'bash'
     args:
       - '-c'
-      - './host.sh'
+      - 'chmod +x ./host.sh'
 
 # Optionnel : spécifiez les substitutions, images, etc.
 timeout: '120s'
