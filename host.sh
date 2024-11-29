@@ -7,7 +7,7 @@ set -e
 # ca doit etre un "one liner"
 # style: gcloud builds submit --config=https://github.com/username/repository/blob/branch/cloudbuild.yaml
 # TODO REMOVE
-#gcloud config set project host-437615
+# gcloud config set project host-437615
 
 # COLORS
 RED="31"
